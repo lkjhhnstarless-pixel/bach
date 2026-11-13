@@ -135,6 +135,10 @@ svg { display: block; }
   border: 2px solid var(--ink); border-radius: 8px; background: #fffaf0; text-align: center;
   user-select: text; -webkit-user-select: text;
 }
+#title .clsrow { display: flex; flex-wrap: wrap; gap: 10px; justify-content: center; margin: 0 0 12px; }
+#title .clsrow button { font: inherit; font-size: 1.15rem; min-width: 84px; min-height: 48px; padding: 6px 16px; border: 2px solid var(--ink-soft); border-radius: 24px; background: var(--paper-2); color: var(--ink); cursor: pointer; }
+#title .clsrow button.on { background: #7a1f2b; border-color: #7a1f2b; color: #fff; }
+#title input[hidden] { display: none; }
 #title .players { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; margin: 12px 0 0; }
 #title .players button { border: 1px solid var(--ink-soft); background: var(--paper-2); border-radius: 18px; padding: 8px 14px; font-size: 1rem; cursor: pointer; min-height: 40px; }
 #title .credit { font-size: .78rem; color: var(--ink-soft); margin: 14px 0 0; }
@@ -1668,6 +1672,11 @@ const PHOTO_CREDITS = [
   { city: '萊比錫', artist: 'Tuxyso', lic: 'CC BY-SA 3.0', page: 'https://commons.wikimedia.org/wiki/File:Thomaskirche_Leipzig_Westseite_2013.jpg' },
   { city: '德勒斯登', artist: 'Ronny Kreutel', lic: '公有領域', page: 'https://commons.wikimedia.org/wiki/File:Frauenkirche-dresden.jpg' },
 ];
+
+// ---------- 班級成績收集（網路版） ----------
+// SHEET_URL：Google 試算表 Apps Script 部署後的網址；留空字串＝不收集、不鎖關卡
+const CLASS_LIST = ['409', '410', '411'];
+const SHEET_URL = 'https://script.google.com/macros/s/AKfycby6QRKADY5yrajXI-eI_NgU1Tjb8mJ1iqF_wiRK7unoQ_uoqLDmKKug2QfHLgr7UrJnXA/exec';
 // ===== 關卡：每關是一個函式，完成時回傳 { stars, mistakes } =====
 const starsFor = (mistakes, two) => mistakes === 0 ? 3 : mistakes <= two ? 2 : 1;
 
@@ -3060,6 +3069,54 @@ const Sync = (() => {
   return { push() { if (!on) return; clearTimeout(t); t = setTimeout(send, 600); } };
 })();
 
+// ---------- 班級成績收集（網路版 → Google 試算表） ----------
+// 選了班級和座號登入的學生：每關只記第一次的成績（之後可重玩當練習），過關後把成績和問答答案送到試算表
+// 沒網路時先存在這台裝置，下次連上再送；老師在試算表刪掉某一列＝讓學生重玩那一關
+const Class = (() => {
+  const on = WEB && !!SHEET_URL;
+  const PKEY = 'bachJourney.pending';
+  let pending = [];
+  try { pending = JSON.parse(localStorage.getItem(PKEY) || '[]'); } catch (e) { }
+  const keep = () => { try { localStorage.setItem(PKEY, JSON.stringify(pending)); } catch (e) { } };
+  const call = async params => {
+    const r = await fetch(SHEET_URL + '?' + new URLSearchParams(params), { cache: 'no-store' });
+    const j = await r.json(); if (!j.ok) throw new Error(j.err || 'fail'); return j;
+  };
+  let busy = null;
+  function flush() {
+    if (busy) return busy;
+    busy = (async () => {
+      while (pending.length) {
+        try { await call(pending[0]); } catch (e) { return false; }
+        pending.shift(); keep();
+      }
+      return true;
+    })().finally(() => { busy = null; });
+    return busy;
+  }
+  return {
+    on, flush,
+    graded: p => on && !!(p && p.cls),
+    // 登入時問試算表：這個座號已經玩過哪幾關（換平板、清掉資料也一樣鎖住）
+    async status(p) {
+      await flush();
+      try {
+        const j = await call({ action: 'status', cls: p.cls, seat: p.seat });
+        const server = {};
+        j.levels.forEach(l => { const id = ORDER[l.n - 1]; if (id) server[id] = l; });
+        const waiting = new Set(pending.filter(x => x.cls === p.cls && +x.seat === +p.seat).map(x => ORDER[x.n - 1]));
+        Object.keys(p.levels).forEach(id => { if (!server[id] && !waiting.has(+id)) delete p.levels[id]; });
+        Object.entries(server).forEach(([id, l]) => { if (!p.levels[id]) p.levels[id] = { stars: l.stars, quiz: l.right, score: l.score }; });
+        Store.save(); return true;
+      } catch (e) { return false; }
+    },
+    save(p, id, rec) {
+      pending.push({ action: 'save', cls: p.cls, seat: p.seat, n: ORDER.indexOf(id) + 1, city: CITIES.find(c => c.id === id).name, ...rec });
+      keep(); return flush();
+    },
+  };
+})();
+
 // ---------- 介面小工具 ----------
 const UI = {
   show(id) { document.querySelectorAll('.screen').forEach(s => s.classList.toggle('active', s.id === id)); },
@@ -3120,21 +3177,55 @@ function renderTitle() {
       <h1>巴赫的音樂旅程</h1>
       <div class="latin">Johann Sebastian Bach · 1685 – 1750</div>
       <div class="flour">${Art.flourish()}</div>
-      <label for="nameIn">請輸入你的座號或暱稱</label>
-      <input id="nameIn" maxlength="10" placeholder="例如：12號小安" autocomplete="off">
-      ${players.length ? `<div class="players">${players.map(p => `<button data-n="${esc(p.name)}">繼續：${esc(p.name)}</button>`).join('')}</div>` : ''}
+      ${Class.on ? `<label>選擇你的班級</label>
+      <div class="clsrow">${CLASS_LIST.map(c => `<button data-c="${c}">${c} 班</button>`).join('')}<button data-c="-">其他</button></div>
+      <input id="seatIn" type="number" inputmode="numeric" min="1" max="50" placeholder="輸入座號，例如：12" autocomplete="off" hidden>
+      <input id="nameIn" maxlength="10" placeholder="輸入暱稱（不記錄成績）" autocomplete="off" hidden>`
+      : `<label for="nameIn">請輸入你的座號或暱稱</label>
+      <input id="nameIn" maxlength="10" placeholder="例如：12號小安" autocomplete="off">`}
+      ${players.length && !Class.on ? `<div class="players">${players.map(p => `<button data-n="${esc(p.name)}">繼續：${esc(p.name)}</button>`).join('')}</div>` : ''}
       <div class="row"><button class="btn wine" id="goBtn">開始旅程</button><button class="btn plain" id="rankBtn1">排行榜</button></div>
       <p class="credit">樂器錄音：Versilian Studios（VSCO 2 CE、VCSL，CC0 授權）；管風琴錄音：Simon Dalzell / Ivy Audio${WEB ? '' : '；小號：Wynton Marsalis〈大黃蜂的飛行〉；小提琴：Rafael Krux'}</p>
       <p class="credit">地圖城市照片（Wikimedia Commons）：${PHOTO_CREDITS.map(c => `<a href="${c.page}" target="_blank" rel="noopener">${c.city}・${c.artist}</a>（${c.lic}）`).join('、')}</p>
     </div></div>`;
-  const go = (name) => {
+  let cls = '';
+  const enter = async () => {
+    const p = Store.me();
+    if (Class.graded(p)) {
+      UI.toast('連線中，查看你玩過哪些關卡…', 8000);
+      const ok = await Class.status(p);
+      UI.toast(ok ? `歡迎 ${p.name}！每一關的成績只記第一次，要認真玩喔！` : '沒有連上網路：成績會先存在這台裝置，連上網路後再送出', 4000);
+    }
+    renderHub(); UI.show('hub');
+  };
+  const go = name => {
     Audio.init();
     name = (name || '').trim();
     if (!name) { UI.toast('請先輸入座號或暱稱'); $('#nameIn').focus(); return; }
-    Store.login(name); renderHub(); UI.show('hub');
+    Store.login(name); enter();
   };
-  $('#goBtn').onclick = () => go($('#nameIn').value);
-  $('#nameIn').onkeydown = e => { if (e.key === 'Enter') go(e.target.value); };
+  const goSeat = async () => {
+    Audio.init();
+    const seat = Math.round(+$('#seatIn').value);
+    if (!(seat >= 1 && seat <= 50)) { UI.toast('請輸入正確的座號（1～50）'); $('#seatIn').focus(); return; }
+    if (!await UI.confirm(`你是 ${cls} 班 ${seat} 號嗎？`, '座號不要打錯喔！成績會記在這個座號，每一關只記第一次玩的成績。', '對，開始', '我要改')) return;
+    Store.login(`${cls}班 ${seat}號`); Object.assign(Store.me(), { cls, seat }); Store.save(); enter();
+  };
+  $('#goBtn').onclick = () => {
+    if (!Class.on) return go($('#nameIn').value);
+    if (!cls) { UI.toast('請先選擇班級'); return; }
+    cls === '-' ? go($('#nameIn').value) : goSeat();
+  };
+  $('#nameIn').onkeydown = e => { if (e.key === 'Enter') $('#goBtn').click(); };
+  if (Class.on) {
+    $('#seatIn').onkeydown = e => { if (e.key === 'Enter') $('#goBtn').click(); };
+    t.querySelectorAll('.clsrow button').forEach(b => b.onclick = () => {
+      cls = b.dataset.c;
+      t.querySelectorAll('.clsrow button').forEach(x => x.classList.toggle('on', x === b));
+      $('#seatIn').hidden = cls === '-'; $('#nameIn').hidden = cls !== '-';
+      (cls === '-' ? $('#nameIn') : $('#seatIn')).focus();
+    });
+  }
   t.querySelectorAll('.players button').forEach(b => b.onclick = () => go(b.dataset.n));
   $('#rankBtn1').onclick = () => { renderRank('title'); UI.show('rank'); };
 }
@@ -3537,6 +3628,7 @@ function renderMap() {
   $('#toCards').onclick = () => { renderCards('map'); UI.show('cards'); };
   $('#toRank').onclick = () => { renderRank('map'); UI.show('rank'); };
   $('#toHub').onclick = () => { renderHub(); UI.show('hub'); };
+  if (Class.graded(p)) Class.flush();   // 之前沒送出去的成績，再試一次
   const panel = $('.cardpanel', m); if (panel) panel.onclick = () => { renderCards('map'); UI.show('cards'); };
   m.querySelectorAll('.city').forEach(g => g.onclick = () => {
     const id = +g.dataset.id, st = cityState(id), c = CITIES.find(x => x.id === id);
@@ -3558,7 +3650,7 @@ function renderHub() {
   const vrow = (id, cls = '') => !VIDEOS[id] ? '' : `<button class="vrow ${cls}" data-v="${id}">🎬 ${VIDEOS[id].title}<span>約 ${VIDEOS[id].min} 分鐘${seen(id)}</span></button>`;
   h.innerHTML = `<div class="topbar"><h2>巴赫音樂劇場<small>Bach Theater</small></h2>
     <span class="chip">👤 ${esc(p.name)}</span><span class="chip">★ ${Store.stars(p)}　總分 ${Store.total(p)}</span>
-    <button class="btn small" id="hCards">卡牌冊</button><button class="btn small" id="hRank">排行榜</button><button class="btn small plain" id="hTitle">換玩家</button></div>
+    <button class="btn small" id="hCards">卡牌冊</button><button class="btn small" id="hRank">排行榜</button></div>
     <div class="hubbody">
       ${vrow('intro', 'wide')}
       <div class="units">
@@ -3573,7 +3665,6 @@ function renderHub() {
     </div>`;
   $('#hCards').onclick = () => { renderCards('hub'); UI.show('cards'); };
   $('#hRank').onclick = () => { renderRank('hub'); UI.show('rank'); };
-  $('#hTitle').onclick = () => { renderTitle(); UI.show('title'); };
   $('#u1').onclick = () => { Audio.init(); renderMap(); UI.show('map'); };
   $('#u2').onclick = () => { Audio.init(); renderLab(); UI.show('lab'); };
   $('#u3').onclick = () => { Audio.init(); renderMusic(); UI.show('music'); };
@@ -3670,16 +3761,24 @@ async function runLevel(id) {
   await wait(500);
   await UI.dialogue(STORY[id].outro);
   if (quit) return;
-  const right = await quiz(QUIZ[id], c.name);
+  const answers = [];
+  const right = await quiz(QUIZ[id], c.name, answers);
   if (quit) return;
   const score = res.stars * 100 + right * 50;
-  Store.record(id, { stars: res.stars, quiz: right, score });
+  const me = Store.me(), graded = Class.graded(me), first = !me.levels[id];
+  // 班級模式：只記第一次；之後重玩是練習，地圖上的星星和試算表都維持第一次的成績
+  const practice = graded && !first;
+  if (!practice) Store.record(id, { stars: res.stars, quiz: right, score });
+  if (graded && first) Class.save(me, id, {
+    stars: res.stars, score, right,
+    q: answers.map(a => a.q).join(' / '), pick: answers.map(a => a.pick).join(' / '), ans: answers.map(a => a.ans).join(' / '),
+  }).then(ok => { if (!ok) UI.toast('成績先存在這台裝置，連上網路後會自動送出', 3500, true); });
   const earn = CARDS.filter(k => k.level === id && (!k.bonus || right === QUIZ[id].length)).map(k => k.id);
   const fresh = Store.addCards(earn);
-  showResult(id, res, right, score, fresh);
+  showResult(id, res, right, score, fresh, practice);
 }
 
-function quiz(qs, city) {
+function quiz(qs, city, log = []) {
   return new Promise(res => {
     let i = 0, right = 0;
     const next = () => {
@@ -3690,6 +3789,7 @@ function quiz(qs, city) {
       const bs = m.querySelectorAll('.opts button');
       bs.forEach(b => b.onclick = () => {
         const o = opts[+b.dataset.k];
+        log.push({ q: q.q, pick: o.t, ans: q.a[0] });
         bs.forEach((x, k) => { x.disabled = true; if (opts[k].ok) x.classList.add('right'); });
         if (o.ok) { right++; Audio.sfx.ok(); $('.why', m).innerHTML = '⭕ 答對了！' + q.why; }
         else { b.classList.add('wrong'); Audio.sfx.bad(); $('.why', m).innerHTML = '❌ 差一點！' + q.why; }
@@ -3702,17 +3802,17 @@ function quiz(qs, city) {
   });
 }
 
-function showResult(id, res, right, score, fresh) {
-  const p = Store.me(), best = p.levels[id].score, qn = QUIZ[id].length;
+function showResult(id, res, right, score, fresh, practice = false) {
+  const p = Store.me(), best = p.levels[id].score, qn = QUIZ[id].length, graded = Class.graded(p);
   const bonus = CARDS.find(k => k.level === id && k.bonus);
   const missBonus = bonus && !p.cards.includes(bonus.id);
   const m = UI.modal(`<h3>過關成功！</h3>
     <div class="stars">${[0, 1, 2].map(k => `<div class="s" style="animation-delay:${.2 + k * .25}s">${Art.star(k < res.stars)}</div>`).join('')}</div>
     <p class="scoreline">闖關表現：${res.stars} 顆星 × 100 ＝ ${res.stars * 100}<br>問答答對：${right} / ${qn} 題 × 50 ＝ ${right * 50}</p>
-    <p><b>本次得分 ${score}</b>　（最佳成績 ${best}）</p>
+    <p><b>本次得分 ${score}</b>${graded ? '' : `　（最佳成績 ${best}）`}</p>
     ${fresh.length ? `<p>🎴 得到 ${fresh.length} 張新卡牌！點卡牌可以放大看介紹。</p><div class="newcards"></div>` : '<p>這一關的卡牌你都收集過了。</p>'}
     ${missBonus ? '<p style="color:#7a1f2b">💡 問答全部答對，可以多拿一張特別卡牌喔！</p>' : ''}
-    ${res.stars < 3 ? '<p style="color:#6b5238">再玩一次、減少失誤，就能拿到 3 顆星！</p>' : ''}
+    ${practice ? '<p style="color:#6b5238">這次是練習，老師那邊的成績以第一次為準。</p>' : graded ? '<p style="color:#6b5238">成績已記錄！之後可以再玩當練習，但成績以第一次為準。</p>' : res.stars < 3 ? '<p style="color:#6b5238">再玩一次、減少失誤，就能拿到 3 顆星！</p>' : ''}
     <div class="row"><button class="btn plain" id="again">再玩一次</button><button class="btn wine" id="toMap">回地圖</button></div>`);
   [0, 1, 2].forEach(k => k < res.stars && setTimeout(() => Audio.sfx.star(k), 250 + k * 250));
   const nc = $('.newcards', m);
